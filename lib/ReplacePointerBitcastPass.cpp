@@ -244,6 +244,47 @@ unsigned CalculateNumIter(unsigned SrcTyBitWidth, unsigned DstTyBitWidth) {
   return NumIter;
 }
 
+// Return whether 'Ty' is a struct of scalars or vectors without any padding,
+// so that the bits of a value of type 'Ty' can be split into its members.
+bool IsSplittableStruct(const DataLayout &DL, Type *Ty) {
+  auto STy = dyn_cast<StructType>(Ty);
+  if (STy == nullptr || STy->isOpaque() ||
+      DL.getStructLayout(STy)->hasPadding()) {
+    return false;
+  }
+  for (auto EleTy : STy->elements()) {
+    if (!EleTy->isIntOrIntVectorTy() && !EleTy->isFPOrFPVectorTy()) {
+      return false;
+    }
+    if (DL.getTypeStoreSizeInBits(EleTy) != DL.getTypeAllocSizeInBits(EleTy)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// Return the number of members of 'Ty' that a value of type 'ValueTy' stored at
+// the start of 'Ty' covers, if 'Ty' is a splittable struct which size is not a
+// multiple of the size of 'ValueTy', and the value covers whole members. Return
+// 0 otherwise.
+unsigned GetNumMembersCoveredByStore(const DataLayout &DL, Type *Ty,
+                                     Type *ValueTy) {
+  if (!IsSplittableStruct(DL, Ty) ||
+      SizeInBits(DL, Ty) <= SizeInBits(DL, ValueTy) ||
+      SizeInBits(DL, Ty) % SizeInBits(DL, ValueTy) == 0) {
+    return 0;
+  }
+  auto *STy = cast<StructType>(Ty);
+  uint64_t StoreBitWidth = DL.getTypeStoreSizeInBits(ValueTy);
+  uint64_t MembersBitWidth = 0;
+  unsigned NumMembers = 0;
+  while (MembersBitWidth < StoreBitWidth) {
+    MembersBitWidth +=
+        DL.getTypeStoreSizeInBits(STy->getElementType(NumMembers++));
+  }
+  return MembersBitWidth == StoreBitWidth ? NumMembers : 0;
+}
+
 Value *ComputeLoad(IRBuilder<> &Builder, Value *OrgGEPIdx, bool IsGEPUser,
                    Value *Src, Type *SrcTy, Type *DstTy,
                    SmallVector<Value *, 4> &NewAddrIdxs,
@@ -313,7 +354,21 @@ Value *ComputeLoad(IRBuilder<> &Builder, Value *OrgGEPIdx, bool IsGEPUser,
     DstTy = FixedVectorType::get(DstEleTy, 4);
   }
 
-  if (SrcTyBitWidth > DstTyBitWidth) {
+  const DataLayout &DL = Builder.GetInsertBlock()->getModule()->getDataLayout();
+  if (!IsGEPUser && SrcTyBitWidth > DstTyBitWidth &&
+      SrcTyBitWidth % DstTyBitWidth != 0 && IsSplittableStruct(DL, SrcTy)) {
+    // ExtractSubElement cannot extract DstTy from a value whose size is not a
+    // multiple of the size of DstTy, e.g. i64 from { i32, i32, i32 }. As the
+    // load is from the start of the struct, build DstTy from its first members
+    // instead.
+    assert(LDValues.size() == 1);
+    SmallVector<Value *, 8> Elements;
+    GatherBaseElements(LDValues[0], &Elements, Builder);
+    unsigned UsedBits = 0;
+    unsigned Index = 0;
+    LDValues[0] =
+        BuildFromElements(DstTy, Elements, &UsedBits, &Index, Builder);
+  } else if (SrcTyBitWidth > DstTyBitWidth) {
     assert(LDValues.size() == 1);
     ExtractSubElement(DstTy, Builder, OrgGEPIdx, LDValues);
   } else {
@@ -361,6 +416,30 @@ void ComputeStore(IRBuilder<> &Builder, StoreInst *ST, Value *OrgGEPIdx,
   Type *SrcEleTy = GetEleType(SrcTy);
   unsigned SrcTyBitWidth = SizeInBits(Builder, SrcTy);
   unsigned SrcEleTyBitWidth = SizeInBits(Builder, SrcEleTy);
+
+  // When storing to the start of a struct which size is not a multiple of the
+  // size of the stored value, e.g. an i64 into { i32, i32, i32 }, split the
+  // value into the members it covers.
+  const DataLayout &DL = Builder.GetInsertBlock()->getModule()->getDataLayout();
+  unsigned NumMembers =
+      IsGEPUser ? 0 : GetNumMembersCoveredByStore(DL, SrcTy, DstTy);
+  if (NumMembers > 0) {
+    auto *STy = cast<StructType>(SrcTy);
+    SmallVector<Value *, 8> Elements;
+    GatherBaseElements(ST->getValueOperand(), &Elements, Builder);
+    unsigned UsedBits = 0;
+    unsigned Index = 0;
+    for (unsigned i = 0; i < NumMembers; i++) {
+      Value *Member = BuildFromElements(STy->getElementType(i), Elements,
+                                        &UsedBits, &Index, Builder);
+      // Struct indices must be i32 constants.
+      SmallVector<Value *, 4> MemberAddrIdxs(AddrIdxs);
+      MemberAddrIdxs.push_back(Builder.getInt32(i));
+      Builder.CreateStore(Member,
+                          Builder.CreateGEP(OrigSrcTy, Src, MemberAddrIdxs));
+    }
+    return;
+  }
 
   SmallVector<Value *, 8> STValues;
   Value *STVal = ST->getValueOperand();
@@ -618,6 +697,17 @@ bool DowngradeModule(Module &M) {
         }
         if (!isStore && !IsComplexStruct(DL, source_ty)) {
           continue;
+        }
+
+        // Don't downgrade stores to structs where the size is
+        // not a multiple of the struct type size (e.g. { i32, i32, i32 }
+        // downgraded to i64)
+        if (auto *store = dyn_cast<StoreInst>(&I)) {
+          if (!IsComplexStruct(DL, source_ty) &&
+              GetNumMembersCoveredByStore(
+                  DL, source_ty, store->getValueOperand()->getType()) > 0) {
+            continue;
+          }
         }
 
         if (auto gep = dyn_cast<GetElementPtrInst>(&I)) {

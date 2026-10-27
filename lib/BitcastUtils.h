@@ -43,6 +43,12 @@ void BitcastIntoVector(IRBuilder<> &Builder, SmallVector<Value *, 8> &Values,
 void ConvertInto(Type *Ty, IRBuilder<> &Builder,
                  SmallVector<Value *, 8> &Values);
 
+void GatherBaseElements(Value *v, SmallVectorImpl<Value *> *elements,
+                        IRBuilder<> &builder);
+Value *BuildFromElements(Type *dst_type, const ArrayRef<Value *> &src_elements,
+                         unsigned *used_bits, unsigned *index,
+                         IRBuilder<> &builder);
+
 bool RemoveCstExprFromFunction(Function *F);
 
 bool IsImplicitCasts(Module &M, DenseMap<Value *, Type *> &type_cache,
